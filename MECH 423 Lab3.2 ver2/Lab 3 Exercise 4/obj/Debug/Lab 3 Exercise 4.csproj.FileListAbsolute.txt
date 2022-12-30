@@ -1,0 +1,6 @@
+C:\Users\mfonn\OneDrive\Desktop\Kiran's Work\MECH423\Lab 3\MECH 423 Lab3.2 ver2\Lab 3 Exercise 4\obj\Debug\Lab 3 Exercise 4.csproj.AssemblyReference.cache
+C:\Users\mfonn\OneDrive\Desktop\Kiran's Work\MECH423\Lab 3\MECH 423 Lab3.2 ver2\Lab 3 Exercise 4\obj\Debug\Lab 3 Exercise 4.csproj.SuggestedBindingRedirects.cache
+C:\Users\mfonn\OneDrive\Desktop\Kiran's Work\MECH423\Lab 3\MECH 423 Lab3.2 ver2\Lab 3 Exercise 4\obj\Debug\MECH_423_Lab3._2.Form1.resources
+C:\Users\mfonn\OneDrive\Desktop\Kiran's Work\MECH423\Lab 3\MECH 423 Lab3.2 ver2\Lab 3 Exercise 4\obj\Debug\Lab_3_Exercise_4.Properties.Resources.resources
+C:\Users\mfonn\OneDrive\Desktop\Kiran's Work\MECH423\Lab 3\MECH 423 Lab3.2 ver2\Lab 3 Exercise 4\obj\Debug\Lab 3 Exercise 4.csproj.GenerateResource.cache
+C:\Users\mfonn\OneDrive\Desktop\Kiran's Work\MECH423\Lab 3\MECH 423 Lab3.2 ver2\Lab 3 Exercise 4\obj\Debug\Lab 3 Exercise 4.csproj.CoreCompileInputs.cache

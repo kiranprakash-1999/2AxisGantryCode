@@ -1,0 +1,396 @@
+#include <msp430.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/**
+ * main.c
+ */
+
+typedef struct {
+    int * buffer;
+    int head;
+    int tail;
+    int maxlen;
+} cbuf;
+
+int enqueue(cbuf *c, int data);
+int dequeue(cbuf *c);
+int peek(cbuf *c);
+void initialize(cbuf *c);
+void errorMessage(int t);
+void sendPacket(int cmdSpecial);
+
+
+int val; //variable to store dequeue values
+int errorType = -1; // state variable for whether buffer is overrun or underrun, or invalid packet
+double scalar = 1; //to scale 65535 to 40000, the TB0CCR0 value
+
+// packet variables
+volatile unsigned int packet[5];
+volatile unsigned int start, cmd, dataH, dataL, esc;
+volatile unsigned int fullSpaces, data16Bit;
+volatile unsigned int startOut, cmdOut, hByteOut, lByteOut, escOut;
+volatile unsigned int waitForStart;
+volatile unsigned int sendStream = 0;
+
+// motor speed variables
+volatile unsigned int i;
+
+
+
+cbuf myBuffer;
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;   // stop watchdog timer
+
+    // Configure clocks
+    CSCTL0 = 0xA500;                           // Write password to modify CS registers
+    CSCTL1 |= DCOFSEL_3;                       // Set max. DCO setting 8MHz
+    CSCTL2 |= SELA_3 + SELS_3 + SELM_3;        // set ACLK = SMCLK = DCO
+    CSCTL3 |= DIVM__1 + DIVA__1 + DIVS__1;     // set all dividers = 1 therefore SMCLK = 8MHz
+
+    // Configure ports for UART
+    P2SEL0 &= ~(BIT5 + BIT6);
+    P2SEL1 |= BIT5 + BIT6;
+
+    // Configure UART
+    UCA1CTLW0 |= UCSSEL0;
+    UCA1MCTLW = UCOS16 + UCBRF0 + 0x4900;
+    UCA1BRW = 52;
+    UCA1CTLW0 &= ~UCSWRST;
+    UCA1IE |= UCRXIE; //enable UART receive interrupt
+
+
+    P3DIR  |= BIT6 + BIT7;
+    //P3SEL0 |= BIT6 + BIT7;                      // P3.6 and p3.7 set as Tb2.1 and tb2.2
+    P3OUT  |= BIT6;
+    P3OUT &= ~BIT7;
+    PJDIR |= BIT0;
+
+    // set up timer to up mode and reset to make 200Hz square wave
+    TB2CTL |= TBSSEL_2 + MC_1 + ID__1 + TBCLR; // SMCLK, UP mode, divide clock by 1 to 8MHz, clear count
+    TB2CCR0 = 65535;    // 8MHz/40000 = 200Hz
+    TB2CCTL0 |= OUTMOD_7; // Compare mode (default, not included in code), enable interrupt, reset/set
+    TB2CCR1 = 32000;      //half duty cycle
+    TB2CCTL1 |= OUTMOD_7; //set to reset/set mode
+
+    //Setup pin 2.1 to output TB2.1
+    P2DIR |= BIT1; //Set P3.4 to output
+    P2SEL1 &= ~BIT1; //to output TB1
+    P2SEL0 |= BIT1;
+
+    // set encoder outputs (routed to pins 1.1 and 1.2) to TA0CLK (1.2) and TA1CLK (1.1)
+    // by doing this, TAR increments for every pulse of the encoder.
+            P1DIR &= ~(BIT1 + BIT2);
+            P1SEL0 &= ~(BIT1 + BIT2);
+            P1SEL1 |= BIT1 + BIT2;
+
+            TA1CTL |= TASSEL_0 + MC_2; //use input TA1CLK as input.
+            TA0CTL |= TASSEL_0 + MC_2; //use input TA0CLK as input.
+
+            //Configure timer B1.1 to interrupt based on TB1CCR1
+            TB1CTL |= TBSSEL_2 + MC_1 + TBCLR + ID__1; // SMCLK, UP mode, divide clock by 8 to 1MHz, clear count
+            TB1CCR0 = 65536-1;                            // PWM Period; 1000 clock cycles at 5khz means timer has 500Hz
+            TB1CCTL1 |= OUTMOD_7 + CCIE;                  // CCR1 reset/set
+            TB1CCR1 = 32000;                            // CCR1 PWM duty cycle
+
+            P3DIR |= BIT4;
+            P3SEL0 |= BIT4;
+
+
+    _EINT();    //Global interrupt enable
+
+    initialize(&myBuffer);
+
+    while (1);
+    return 0;
+
+}
+
+#pragma vector = TIMER1_B1_VECTOR
+__interrupt void Timer1_B1_ISR (void)
+{
+   if (sendStream == 1){
+       sendPacket(0);
+   }
+   if (fullSpaces >= 5){
+       waitForStart = dequeue(&myBuffer);
+               while(waitForStart != 255){
+                   waitForStart = dequeue(&myBuffer);
+               }
+
+               packet[0] = waitForStart; // should equal 255
+               waitForStart = -1; //reset wfs
+               for (i = 1; i < 5; i++){
+                   packet[i] = dequeue(&myBuffer);
+               }
+               //checks all invalid packet permutations
+               if(packet[0]!= 255||packet[1]>1||packet[2]==255||packet[3]==255||packet[4]>3){
+
+                   if (packet[0]== 255 && packet[1]==13){
+                           // dequeue buffer
+                       val = dequeue(&myBuffer);
+                       while (!(UCA1IFG & UCTXIFG));
+                       UCA1TXBUF = val;
+                   }
+                   else if (packet[0] == 255 && packet[1]==98){
+                       // dequeue buffer
+                       if(sendStream == 0){
+                           sendStream = 1;
+                       }
+                       else if(sendStream == 1){
+                           sendStream = 0;
+                       }
+                   }
+                   else{
+                       errorType = 2;
+                       errorMessage(errorType);
+                   }
+               }
+
+               else{
+               start = packet[0];
+               cmd = packet[1];
+               dataH = packet[2];
+               dataL = packet[3];
+               esc = packet[4];
+
+               // modify packet based on escape byte
+               if(esc == 1){
+                   dataL = 255;
+               }
+               else if(esc == 2){
+                   dataH = 255;
+               }
+               else if(esc == 3){
+                   dataL = 255;
+                   dataH = 255;
+               }
+
+               if (cmd==0){ //Change pins to power motor to run clockwise
+                   P3OUT |= BIT6;
+                   P3OUT &= ~BIT7;
+                   }
+               if (cmd==1){ //Change pins to power motor to run counter clockwise
+                   P3OUT &= ~BIT6;
+                   P3OUT |= BIT7;
+               }
+
+               data16Bit = dataH * 256 + dataL;
+               TB2CCR1 = (data16Bit/scalar);
+               sendPacket(cmd+2);
+
+               }
+
+   }
+   TB1CCTL1 &= ~CCIFG;
+
+}
+
+
+#pragma vector = USCI_A1_VECTOR
+__interrupt void USCI_A1_ISR(void)
+{
+    PJOUT ^= BIT0;
+    //intialize Rx to NULL
+    unsigned char RxByte = 0;
+    RxByte = UCA1RXBUF;
+        enqueue(&myBuffer,RxByte);
+
+}
+
+
+// CREDIT FOR BUFFER IMPLEMENTATION: embedjournal
+
+void initialize(cbuf*c){
+    c->head = 0;
+    c->tail = 0;
+    c->maxlen = 50;
+    c->buffer = (int*) malloc(c->maxlen*sizeof(int));
+}
+
+int enqueue(cbuf *c, int data)
+{
+    int next = c->head + 1;
+
+    if (next >= c->maxlen) // circular buffer seen here
+        next = 0;
+
+    if (next == c->tail){  // if the head + 1 == tail, circular buffer is full
+        errorType = 1;
+        errorMessage(errorType);
+        return -1; // if overrun, head will not become next and stay where it is
+    }
+
+    c->buffer[c->head] = data;  // Load data
+    c->head = next;             // set head to next if no error.
+
+    if(c->head >= c->tail){
+        fullSpaces = c->head - c->tail;
+       }
+    else{
+        fullSpaces = (c->head + 50) - c->tail;
+       }
+
+    return 0;  // return 0 to indicate successful enqueue
+}
+
+int dequeue(cbuf *c)
+{
+    if (c->head == c->tail){  // if the head == tail, we don't have any data
+        errorType = 0;
+        errorMessage(errorType);
+        return -1; // failed dequeue; dont change tail to next
+    }
+
+    int next = c->tail + 1;
+
+    if(next >= c->maxlen) // circular buffer seen here
+        next = 0;
+
+    int dequeuedVal = c->buffer[c->tail];
+    c->tail = next;
+
+    if(c->head >= c->tail){
+        fullSpaces = c->head - c->tail;
+       }
+    else{
+        fullSpaces = (c->head + 50) - c->tail;
+       }
+
+    return dequeuedVal;  // indicates successful dequeue
+}
+
+int peek(cbuf *c){
+    if (c->head == c->tail){  // if the head == tail, we don't have any data
+            errorType = 0;
+            errorMessage(errorType);
+            return -1; // failed dequeue; dont change tail to next
+        }
+    else{
+        return c->buffer[c->head];
+    }
+}
+
+// transmits error message when buffer is full or buffer is empty
+void errorMessage(int errorType){
+
+    int j;
+
+    if(errorType == 1){
+        char message[] = "buffer is full";
+        for (j = 0; j < sizeof(message); j++){
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = message[j];
+        }
+    }
+
+    else if (errorType == 0){
+        char message[] = "buffer is empty";
+        for (j = 0; j < sizeof(message); j++){
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = message[j];
+        }
+    }
+    else if (errorType == 2){
+            char message[] = "invalid packet";
+            for (j = 0; j < sizeof(message); j++){
+                while (!(UCA1IFG & UCTXIFG));
+                UCA1TXBUF = message[j];
+            }
+        }
+    else if (errorType == 3){
+                char message[] = "flag";
+                for (j = 0; j < sizeof(message); j++){
+                    while (!(UCA1IFG & UCTXIFG));
+                    UCA1TXBUF = message[j];
+                }
+            }
+}
+
+void sendPacket(int cmdSpecial){
+    // process encoder data and send as packet.
+    if(cmdSpecial == 0){
+        hByteOut = TA1R;
+        lByteOut = TA0R;
+
+        if(hByteOut == 255){
+            if(lByteOut == 255){
+                escOut = 3;
+                hByteOut = 0;
+                lByteOut = 0;
+
+            }
+            else {
+                escOut = 1;
+                hByteOut = 0;
+            }
+        }
+        else if(lByteOut == 255){
+            escOut = 2;
+            lByteOut = 0;
+
+        }
+        else{
+            escOut = 0;
+            hByteOut = TA1R; // may need to bit shift by 3
+            lByteOut = TA0R;
+        }
+        cmdOut = 0;
+        startOut = 255;
+
+
+        while (!(UCA1IFG & UCTXIFG));
+        UCA1TXBUF = startOut;
+        while (!(UCA1IFG & UCTXIFG));
+        UCA1TXBUF = cmdOut;
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = hByteOut;
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = lByteOut;
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = escOut;
+    }
+
+    else if(cmdSpecial == 2||cmdSpecial == 3){
+        hByteOut = TB2CCR1 / 256;
+        lByteOut = TB2CCR1 % 256;
+        if(hByteOut == 255){
+                    if( lByteOut == 255){
+                        escOut = 3;
+                        hByteOut = 0;
+                        lByteOut = 0;
+
+                    }
+                    else {
+                        escOut = 1;
+                        hByteOut = 0;
+                    }
+                }
+                else if(lByteOut == 255){
+                    escOut = 3;
+                    lByteOut = 0;
+
+                }
+                else{
+                    escOut = 0;
+                }
+                cmdOut = cmdSpecial;
+                startOut = 255;
+
+
+                while (!(UCA1IFG & UCTXIFG));
+                UCA1TXBUF = startOut;
+                while (!(UCA1IFG & UCTXIFG));
+                UCA1TXBUF = cmdOut;
+                    while (!(UCA1IFG & UCTXIFG));
+                    UCA1TXBUF = hByteOut;
+                    while (!(UCA1IFG & UCTXIFG));
+                    UCA1TXBUF = lByteOut;
+                    while (!(UCA1IFG & UCTXIFG));
+                    UCA1TXBUF = escOut;
+    }
+}
+
+

@@ -1,0 +1,381 @@
+#include <msp430.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/**
+ * main.c
+ */
+
+typedef struct {
+    int * buffer;
+    int head;
+    int tail;
+    int maxlen;
+} cbuf;
+
+int enqueue(cbuf *c, int data);
+int dequeue(cbuf *c);
+int peek(cbuf *c);
+void initialize(cbuf *c);
+void errorMessage(int errorType);
+void halfStep(int dir);
+void stopStepper();
+
+
+int val; //variable to store dequeue values
+int errorType = -1; // state variable for whether buffer is overrun or underrun, or invalid packet
+double scalar = 1.048576; //to scale from 16-bit 65536 to 62500, the TB0CCR0 value
+
+// packet variables
+volatile unsigned int packet[5];
+volatile unsigned int start, cmd, dataH, dataL, esc;
+volatile unsigned int fullSpaces, data16Bit;
+
+//stepper variables
+volatile unsigned int stepperState = 0;
+volatile unsigned int direction = 0;
+int maxStepperSpeed = 10; //TB0CCR0 value that achieves maximum stepper speed, to be found
+int minStepperSpeed = 65536; //TB0CCR0 value that achieves minimum stepper speed (set by designers; min speed = 1Hz)
+
+//test variables
+int i;
+
+cbuf myBuffer;
+
+int main(void)
+{
+    WDTCTL = WDTPW | WDTHOLD;   // stop watchdog timer
+
+        // Configure clocks
+        CSCTL0 = 0xA500;                           // Write password to modify CS registers
+        CSCTL1 |= DCOFSEL_3;                       // Set max. DCO setting 8MHz
+        CSCTL2 |= SELA_3 + SELS_3 + SELM_3;        // set ACLK = SMCLK = DCO
+        CSCTL3 |= DIVM__1 + DIVA__1 + DIVS__16;    // set divider = 1 therefore SMCLK = 8MHz
+
+        // Configure ports for UART
+        P2SEL0 &= ~(BIT5 + BIT6);
+        P2SEL1 |= BIT5 + BIT6;
+
+        // Configure UART
+        UCA1CTLW0 |= UCSSEL0;
+        UCA1MCTLW = UCOS16 + UCBRF0 + 0x4900;
+        UCA1BRW = 52;
+        UCA1CTLW0 &= ~UCSWRST;
+        UCA1IE |= UCRXIE; //enable UART receive interrupt
+
+
+        // Configure stepper pins (AIN1, AIN2, BIN1, BIN2)
+        P3DIR  |= BIT4 + BIT5; //BIN2, BIN1
+        P1DIR  |= BIT4 + BIT5; //AIN2, AIN1
+
+
+        //Configure Pins for TB1.0
+        P2DIR |= BIT2;
+        P2SEL0 |= BIT2;
+        P2SEL1 |= BIT2;
+
+        //Configure Pins for TB1.1
+        P1DIR |= BIT6;
+        P1SEL0 |= BIT6;
+
+        //Configure timer B1.1 to interrupt based on TB1CCR1
+        TB1CTL |= TBSSEL_2 + MC_1 + TBCLR; // SMCLK, UP mode, divide clock by 8 to 1MHz, clear count
+        TB1CCR0 = 2500;                            // PWM Period; 1000 clock cycles at 5khz means timer has 500Hz
+        TB1CCTL1 = OUTMOD_7 + CCIE;                      // CCR1 reset/set
+        TB1CCR1 = 1250;                            // CCR1 PWM duty cycle
+
+
+        _EINT();    //Global interrupt enable
+
+        initialize(&myBuffer);
+
+
+    while(1){
+        while(fullSpaces<5); // wait for enough bytes in a packet to be sent (ie. 5) then unload bytes into packet
+                for (i = 0; i < 5; i++){
+                    packet[i] = dequeue(&myBuffer);
+                }
+                //checks all invalid packet permutations
+                if(packet[0]!= 255||packet[1]>1||packet[2]==255||packet[3]==255||packet[4]>3){
+                    errorMessage(2);
+                }
+
+                else{
+                start = packet[0];
+                cmd = packet[1];
+                dataH = packet[2];
+                dataL = packet[3];
+                esc = packet[4];
+
+                // modify packet based on escape byte
+                if(esc == 1){
+                    dataL = 255;
+                }
+                else if(esc == 2){
+                    dataH = 255;
+                }
+                else if(esc == 3){
+                    dataL = 255;
+                    dataH = 255;
+                }
+
+                if (cmd==0){ //Change pins to power motor to run clockwise
+                    direction = 0;
+                    }
+                else if (cmd==1){ //Change pins to power motor to run counter clockwise
+                    direction = 1;
+                }
+
+                data16Bit = dataH * 256 + dataL; //should be + dataL, but stepper operates fastest when dataL = 100;
+
+                // maps 65535 input -> TB0CCR0 = maxStepperSpeed
+                // maps 1 -> TB0CCR0 = minStepperSpeed.
+                // if data16Bit = 0, explicitly stop motor.
+                if (data16Bit == 0){
+                    stopStepper();
+                }
+
+                else if (data16Bit == 1){
+                    halfStep(0);
+                    errorMessage(3);
+                }
+                else if (data16Bit == 2){
+                    halfStep(1);
+                    errorMessage(4);
+                }
+                else{
+                   TB1CCTL1 |= CCIE;
+                   TB1CCR0 = data16Bit-1;
+                   TB1CCR1 = (data16Bit-1)/2;
+                }
+            }
+    }
+
+    return 0;
+}
+
+#pragma vector = TIMER1_B1_VECTOR
+__interrupt void Timer1_B1_ISR (void)
+{
+    halfStep(direction);
+    TB1CCTL1 &= ~CCIFG;
+}
+
+
+#pragma vector = USCI_A1_VECTOR
+__interrupt void USCI_A1_ISR(void)
+{
+    //intialize Rx to NULL
+    unsigned char RxByte = 0;
+    RxByte = UCA1RXBUF;
+
+    // echo input
+    while (!(UCA1IFG & UCTXIFG));
+    UCA1TXBUF = RxByte;
+
+
+    if(RxByte == 13){ // carriage return ASCII, ie. enter key
+        val = dequeue(&myBuffer);
+        while (!(UCA1IFG & UCTXIFG));
+        UCA1TXBUF = val;
+    }
+
+    else{
+        enqueue(&myBuffer,RxByte);
+    }
+
+}
+
+
+
+
+void initialize(cbuf*c){
+    c->head = 0;
+    c->tail = 0;
+    c->maxlen = 50;
+    c->buffer = (int*) malloc(c->maxlen*sizeof(int));
+}
+
+int enqueue(cbuf *c, int data)
+{
+    int next = c->head + 1;
+
+    if (next >= c->maxlen) // circular buffer seen here
+        next = 0;
+
+    if (next == c->tail){  // if the head + 1 == tail, circular buffer is full
+        errorMessage(1);
+        return -1; // if overrun, head will not become next and stay where it is
+    }
+
+    c->buffer[c->head] = data;  // Load data
+    c->head = next;             // set head to next if no error.
+
+    if(c->head >= c->tail){
+        fullSpaces = c->head - c->tail;
+       }
+    else{
+        fullSpaces = (c->head + 50) - c->tail;
+       }
+
+    return 0;  // return 0 to indicate successful enqueue
+}
+
+int dequeue(cbuf *c)
+{
+    if (c->head == c->tail){  // if the head == tail, we don't have any data
+        errorMessage(0);
+        return -1; // failed dequeue; dont change tail to next
+    }
+
+    int next = c->tail + 1;
+
+    if(next >= c->maxlen) // circular buffer seen here
+        next = 0;
+
+    int dequeuedVal = c->buffer[c->tail];
+    c->tail = next;
+
+    if(c->head >= c->tail){
+        fullSpaces = c->head - c->tail;
+       }
+    else{
+        fullSpaces = (c->head + 50) - c->tail;
+       }
+
+    return dequeuedVal;  // indicates successful dequeue
+}
+
+int peek(cbuf *c){
+    if (c->head == c->tail){  // if the head == tail, we don't have any data
+            errorType = 0;
+            errorMessage(errorType);
+            return -1; // failed dequeue; dont change tail to next
+        }
+    else{
+        return c->buffer[c->head];
+    }
+}
+
+// transmits error message when buffer is full or buffer is empty
+void errorMessage(int errorType){
+
+    int j;
+
+    if(errorType == 1){
+        char message[] = "buffer is full";
+        for (j = 0; j < sizeof(message); j++){
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = message[j];
+        }
+    }
+
+    else if (errorType == 0){
+        char message[] = "buffer is empty";
+        for (j = 0; j < sizeof(message); j++){
+            while (!(UCA1IFG & UCTXIFG));
+            UCA1TXBUF = message[j];
+        }
+    }
+    else if (errorType == 2){
+            char message[] = "invalid packet";
+            for (j = 0; j < sizeof(message); j++){
+                while (!(UCA1IFG & UCTXIFG));
+                UCA1TXBUF = message[j];
+            }
+        }
+    else if (errorType == 3){
+                char message[] = "llllll";
+                for (j = 0; j < sizeof(message); j++){
+                    while (!(UCA1IFG & UCTXIFG));
+                    UCA1TXBUF = message[j];
+                }
+            }
+    else if (errorType == 4){
+                char message[] = "rrrr";
+                for (j = 0; j < sizeof(message); j++){
+                    while (!(UCA1IFG & UCTXIFG));
+                    UCA1TXBUF = message[j];
+                }
+            }
+}
+
+
+
+
+void halfStep(int dir){
+
+    if (dir == 1){
+        if(stepperState == 7){
+            stepperState = 0;
+        }
+        else{
+            stepperState++;
+        }
+    }
+    else if(dir == 0){
+        if(stepperState == 0){
+           stepperState = 7;
+        }
+        else{
+            stepperState--;
+        }
+    }
+
+    switch (stepperState){
+
+    case 0:
+        P3OUT |= BIT4;
+        P3OUT &= ~BIT5;
+        P1OUT &= ~(BIT4 + BIT5);
+        break;
+    case 1:
+        P3OUT |= BIT4;
+        P3OUT &= ~BIT5;
+        P1OUT |= BIT4;
+        P1OUT &= ~BIT5;
+        break;
+    case 2:
+        P3OUT &= ~(BIT4 + BIT5);
+        P1OUT |= BIT4;
+        P1OUT &= ~BIT5;
+        break;
+    case 3:
+        P3OUT |= BIT5;
+        P3OUT &= ~BIT4;
+        P1OUT |= BIT4;
+        P1OUT &= ~BIT5;
+        break;
+    case 4:
+        P3OUT |= BIT5;
+        P3OUT &= ~BIT4;
+        P1OUT &= ~(BIT4 + BIT5);
+        break;
+    case 5:
+        P3OUT |= BIT5;
+        P3OUT &= ~BIT4;
+        P1OUT |= BIT5;
+        P1OUT &= ~BIT4;
+        break;
+    case 6:
+        P3OUT &= ~(BIT4 + BIT5);
+        P1OUT |= BIT5;
+        P1OUT &= ~BIT4;
+        break;
+    case 7:
+        P3OUT |= BIT4;
+        P3OUT &= ~BIT5;
+        P1OUT |= BIT5;
+        P1OUT &= ~BIT4;
+        break;
+
+    }
+
+}
+
+void stopStepper(){
+    P3OUT &= ~(BIT4 + BIT5);
+    P1OUT &= ~(BIT4 + BIT5);
+    TB1CCTL1 &= ~CCIE;
+}
+
